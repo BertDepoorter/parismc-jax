@@ -21,3 +21,4 @@ user_prompt.txt
 verify_baseline.sh
 test_place/
 #draft.tex
+parismc/__pycache__/
