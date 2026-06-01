@@ -9,15 +9,19 @@ This example demonstrates:
 """
 
 import numpy as np
+import jax.numpy as jnp
+import jax
+jax.config.update("jax_enable_x64", True)
+
 from parismc import Sampler, SamplerConfig
 
-# Set global seed immediately
+# Set global seed for reproducibility
 np.random.seed(42)
 
 # Define target distribution parameters at module level
-TRUE_MEAN = np.array([0.3, 0.7])
-TRUE_COV = np.array([[0.01, 0.005], [0.005, 0.02]])
-INV_COV = np.linalg.inv(TRUE_COV)
+TRUE_MEAN = jnp.array([0.3, 0.7])
+TRUE_COV = jnp.array([[0.01, 0.005], [0.005, 0.02]])
+INV_COV = jnp.linalg.inv(TRUE_COV)
 
 def log_density(x):
     """
@@ -28,15 +32,10 @@ def log_density(x):
     """
     # Compute Mahalanobis distance
     diff = x - TRUE_MEAN
-    mahal_dist = np.einsum('ij,jk,ik->i', diff, INV_COV, diff)
+    mahal_dist = jnp.einsum('ij,jk,ik->i', diff, INV_COV, diff)
     
     # Return log-density (without normalization constant)
     return -0.5 * mahal_dist
-
-# Example of a prior transform (commented out):
-# def prior_transform(u):
-#     # Map [0, 1] to physical range, e.g., [0, 10]
-#     return u * 10.0
 
 def main():
     
@@ -46,7 +45,7 @@ def main():
     # Initialize sampler
     ndim = 2
     n_seed = 3
-    init_cov_list = [np.eye(ndim) * 0.05] * n_seed
+    init_cov_list = [jnp.eye(ndim) * 0.05] * n_seed
     
     print("Initializing sampler...")
     sampler = Sampler(
@@ -76,8 +75,8 @@ def main():
     print(f"Effective sample size: {(np.sum(weights)**2)/np.sum(weights**2):.1f}")
     
     # Weighted statistics
-    weighted_mean = np.average(samples, weights=weights, axis=0)
-    weighted_cov = np.cov(samples.T, aweights=weights)
+    weighted_mean = jnp.average(samples, weights=weights, axis=0)
+    weighted_cov = jnp.cov(samples.T, aweights=weights)
     
     print(f"\nTrue mean: {TRUE_MEAN}")
     print(f"Estimated mean: {weighted_mean}")
@@ -137,7 +136,6 @@ def main():
     print("For more complex examples, see multimodal_example.py")
 
 if __name__ == "__main__":
-
     main()
 
 
