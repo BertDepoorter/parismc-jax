@@ -7,18 +7,20 @@ from dataclasses import dataclass
 from multiprocessing import Pool
 
 import numpy as np
+import jax.numpy as jnp
+from jax import jit
+import jax
+jax.config.update("jax_enable_x64", True)
 from scipy.stats import multivariate_normal
 from smt.sampling_methods import LHS
 
 try:
-    # Try to determine if we're running in Jupyter
+    # check if we're in Jupyter env before importing stuff for notebook
     from IPython import get_ipython
     if get_ipython() is not None and 'IPKernelApp' in get_ipython().config:
-        # We're in Jupyter
         from tqdm.notebook import tqdm
     else:
-        # We're not in Jupyter
-        from tqdm import tqdm
+        from tqdm import tqdm   
 except ImportError:
     # IPython is not available, so we're not in Jupyter
     from tqdm import tqdm
@@ -28,6 +30,7 @@ from .utils import (
     weighting_seeds_manycov,
     weighting_seeds_onepoint_with_onemean,
     find_sigma_level,
+    jax_weighted_cov
 )
 from .clustering import (
     get_cluster_indices_cov,
