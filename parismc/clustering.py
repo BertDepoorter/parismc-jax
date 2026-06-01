@@ -5,6 +5,9 @@ from scipy.spatial.distance import mahalanobis
 import scipy.special as sps
 from scipy.stats import multivariate_normal
 
+import jax
+import jax.numpy as jnp
+
 def get_cluster_indices_cov(points, cov_matrices, dist=10):    
     # Initialize clusters and clustered points
     clusters = []
@@ -118,9 +121,6 @@ def merge_arrays(original_lists, cluster_indices, element_num_list, log_like_lis
     return all_merged_lists, new_log_like_list
 
 
-
-
-
 def merge_cov_arrays(original_list, cluster_indices, element_num_list, cov_update_count):
     # Initialize an empty list to hold the merged lists
     merged_lists = []    
@@ -167,12 +167,95 @@ def merge_element_num_list(element_num_list, cluster_indices):
     return new_element_num_list
 
 
+@jax.jit
+def pairwise_mahalanobis_matrix(points, inv_cov_matrices):
+    """Vectorized (n, n) Mahalanobis distance matrix.
+
+    ``D[i, j]`` is the Mahalanobis distance from point ``j`` to point ``i`` measured
+    under point ``i``'s inverse covariance. This is the expensive O(n^2) piece of the
+    greedy distance-merge; computing it in JAX (vmapped, GPU-resident) lets the cheap
+    greedy assignment run on host afterwards.
+
+    Parameters
+    ----------
+    points : array of shape (n, ndim)
+    inv_cov_matrices : array of shape (n, ndim, ndim)
+
+    Returns
+    -------
+    array of shape (n, n)  (not symmetric in general -- each row uses row i's metric)
+    """
+    def dist_from_i(point_i, inv_cov_i):
+        diff = points - point_i                       # (n, ndim)
+        d2 = jnp.einsum('nj,jk,nk->n', diff, inv_cov_i, diff)
+        return jnp.sqrt(jnp.clip(d2, 0.0, None))
+    return jax.vmap(dist_from_i)(points, inv_cov_matrices)
+
+
+def get_cluster_indices_from_matrix(dist_matrix, dist=10, alive=None, priority=None):
+    """Greedy clustering on a precomputed (host-side) Mahalanobis distance matrix.
+
+    Mirrors the semantics of :func:`get_cluster_indices_cov` but consumes the matrix
+    produced by :func:`pairwise_mahalanobis_matrix`, so the quadratic distance work is
+    done once in JAX rather than inside Python loops.
+
+    Parameters
+    ----------
+    dist_matrix : (n, n) array-like
+        Pairwise distances; ``dist_matrix[i, j]`` is j's distance under i's metric.
+    dist : float
+        Merge threshold R_m.
+    alive : (n,) bool array, optional
+        Only cluster entries that are alive. Dead entries become singletons.
+    priority : (n,) array, optional
+        Visiting order is by descending priority (e.g. max log-density), so the highest
+        priority member of a cluster is the survivor (index 0). Defaults to natural order.
+
+    Returns
+    -------
+    list of lists of int
+        Clusters, each sorted; survivor is the highest-priority member (placed first).
+    """
+    dist_matrix = np.asarray(dist_matrix)
+    n = dist_matrix.shape[0]
+    alive = np.ones(n, dtype=bool) if alive is None else np.asarray(alive, dtype=bool)
+
+    if priority is None:
+        order = list(range(n))
+    else:
+        order = list(np.argsort(-np.asarray(priority)))
+
+    clustered = set()
+    clusters = []
+    for i in order:
+        if not alive[i] or i in clustered:
+            continue
+        members = [i]
+        clustered.add(i)
+        for j in order:
+            if j == i or j in clustered or not alive[j]:
+                continue
+            if dist_matrix[i, j] <= dist:
+                members.append(j)
+                clustered.add(j)
+        clusters.append(members)
+
+    # Any remaining (dead or unvisited) indices become their own singletons.
+    for i in range(n):
+        if i not in clustered:
+            clustered.add(i)
+            clusters.append([i])
+
+    # Survivor (highest priority) first, then sorted remainder for stable downstream use.
+    return [[c[0]] + sorted(c[1:]) for c in clusters]
+
+
 def mahalanobis_batch(points_neighbors, point, inv_cov):
     """Vectorized Mahalanobis distance calculation for multiple points."""
     diffs = points_neighbors - point  # Shape: (n_neighbors, n_dims)
     # Perform (p - q)^T @ inv_cov @ (p - q) for all neighbors in one go
-    mahal_dist_sq = np.einsum('ij,jk,ik->i', diffs, inv_cov, diffs)
-    return np.sqrt(mahal_dist_sq)
+    mahal_dist_sq = jnp.einsum('ij,jk,ik->i', diffs, inv_cov, diffs)
+    return jnp.sqrt(mahal_dist_sq)
 
 def find_points_within_threshold_cov(points, point_index, cov_matrices, clustered, distance_threshold=None):
     # Find all potential neighbors using KD-tree as a first filter
@@ -184,10 +267,10 @@ def find_points_within_threshold_cov(points, point_index, cov_matrices, clustere
     # Now calculate the Mahalanobis distances for all neighbors
     point_cov = cov_matrices[point_index]
     point = points[point_index]
-    inv_cov = np.linalg.inv(point_cov)  # Inverse of the covariance matrix
+    inv_cov = jnp.linalg.inv(point_cov)  # Inverse of the covariance matrix
     
     # Get the points corresponding to the neighbor indices
-    points_neighbors = np.array([points[idx] for idx in neighbors])
+    points_neighbors = jnp.array([points[idx] for idx in neighbors])
     
     # Calculate the Mahalanobis distances for all neighbors in one step
     mahal_dists = mahalanobis_batch(points_neighbors, point, inv_cov)
