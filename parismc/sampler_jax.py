@@ -1,23 +1,26 @@
 """JAX-native PARIS importance sampler (re-architected).
 
 This module is a ground-up rewrite of :class:`parismc.sampler.Sampler` that follows
-JAX's value-semantics / static-shape model instead of the original's mutate-a-list-of-
-ragged-NumPy-arrays design. The three architectural requirements driving the rewrite:
+JAX's  static-shape model instead of the original, which traced samples through a mutated list of ragged arrays.
+The rewrite follows the following three principles that keep the advantages of PARIS while making
+the code JAX-friendly.
 
-1. **optax optimizer** for the boundary Beta-correction (``find_max_beta``), not the old
+
+1. **A traced boolean ``alive`` mask** of fixed length ``n_proc_max`` replaces the
+   shrinking Python list of processes. Merging never changes array shapes; it just flips
+   mask bits on the host between jitted blocks. Every per-process kernel is ``vmap``-ed over
+   ``n_proc_max`` and dead rows are excluded from reductions/selection by the mask. This complies 
+   with JAX's static shape requirements for tracing the pyTree during JIT. 
+
+2. **optax optimizer** for the boundary Beta-correction (``find_max_beta``), not the old
    ``scipy``/``jax.scipy`` ``Powell``/``BFGS`` path. The objective is smoothed (sigmoid
    relaxation of the boundary indicator) so it is differentiable, then minimized with a
-   fixed number of projected Adam steps -- fully ``jit``/``vmap`` friendly.
-
-2. **A traced boolean ``alive`` mask** of fixed length ``n_proc_max`` replaces the
-   shrinking Python list of processes. Merging never changes array shapes; it just flips
-   mask bits on host between jitted blocks. Every per-process kernel is ``vmap``-ed over
-   ``n_proc_max`` and dead rows are excluded from reductions/selection by the mask.
+   fixed number of projected Adam steps. This is fully ``jit``/``vmap`` friendly.
 
 3. **No in-place mutation.** All state lives in an immutable :class:`SamplerState`
-   pytree; updates are functional (``.at[...].set/add``). A single jitted ``step`` is
-   driven by ``lax.scan`` over a block of iterations; clustering and I/O happen on host
-   between blocks.
+   pytree. Updates are purely functional (``.at[...].set/add``). A single jitted ``step`` is
+   driven by ``lax.scan`` over a block of iterations while clustering and I/O happen on host
+   between blocks. This balances JIt-advantages with the need for killing redundant processes efficiently.
 
 Design simplifications (documented, not accidental)
 ---------------------------------------------------
@@ -32,12 +35,14 @@ Design simplifications (documented, not accidental)
   point (the importance-weight rejection check was overridden to ``True``).
 * Merging uses the **distance** strategy (Mahalanobis), computed via
   :func:`parismc.clustering.pairwise_mahalanobis_matrix` in JAX with the greedy assignment
-  on host. The weight-based merge can be layered on top of the same host seam.
+  on host. The weight-based merge can be layered on top of the same host.
 
 The expensive ``log_density_func`` (e.g. a JAX LISA likelihood) is ``vmap``-ed over all
-processes inside the jitted step and stays on-device, replacing ``multiprocessing.Pool``.
+processes inside the jitted step and stays on-device, replacing ``multiprocessing.Pool``. 
+A full JAX rewrite of the clustering/merging is possible but the current hybrid approach retains
+dynamic control over the number of processes, which is a major part of PARIS's efficiency.
 """
-
+# handy python stuff
 from __future__ import annotations
 
 import logging
@@ -45,12 +50,14 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Callable, NamedTuple, Optional, Tuple
 
+# set-up JAX and numpy
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
+# Load custom modules
 from .optimization import find_max_beta, oracle_approximating_shrinkage
 from .utils import jax_weighted_cov
 from .clustering import pairwise_mahalanobis_matrix, get_cluster_indices_from_matrix
@@ -58,16 +65,17 @@ from .clustering import pairwise_mahalanobis_matrix, get_cluster_indices_from_ma
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Configuration and state
-# ---------------------------------------------------------------------------
+##===========================================================================
+## Configuration and state
+##===========================================================================
+
 @dataclass(frozen=True)
 class JaxSamplerConfig:
     """Hyperparameters for :class:`JaxSampler`.
 
     Shape-determining fields (``n_proc_max``, ``n_max``, ``alpha``, ``trail_size``,
     ``integral_num``, ``gamma``) are treated as compile-time static; changing them
-    triggers a recompile, which is exactly what we want to avoid at runtime.
+    triggers a recompile.
     """
     n_proc_max: int                 # static upper bound on number of processes (seeds)
     n_max: int                      # static buffer length per process (max accepted points)
@@ -112,9 +120,9 @@ class SamplerState(NamedTuple):
     key: jnp.ndarray           # PRNG key (threaded -- never global state)
 
 
-# ---------------------------------------------------------------------------
+##===========================================================================
 # Sampler
-# ---------------------------------------------------------------------------
+##===========================================================================
 class JaxSampler:
     """Adaptive importance sampler with a jitted inner step and host orchestration.
 
@@ -469,7 +477,9 @@ class JaxSampler:
 
         dist = np.asarray(pairwise_mahalanobis_matrix(jnp.asarray(means), jnp.asarray(inv_covs)))
         clusters = get_cluster_indices_from_matrix(
-            dist, dist=self.cfg.merge_dist, alive=alive,
+            dist, 
+            dist=self.cfg.merge_dist, 
+            alive=alive,
             priority=np.asarray(state.max_logden),
         )
         new_alive = np.zeros_like(alive)
