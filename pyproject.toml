@@ -36,6 +36,7 @@ dependencies = [
     "scikit-learn>=1.0.0",
     "smt>=2.0.0",
     "tqdm>=4.62.0",
+    "corner>=2.2.1",
 ]
 
 [project.optional-dependencies]
