@@ -5,6 +5,7 @@ An advanced Monte Carlo sampler with adaptive covariance and clustering capabili
 """
 
 from .sampler import Sampler, SamplerConfig
+from .sampler_jax import JaxSampler, JaxSamplerConfig
 from .optimization import find_max_beta, oracle_approximating_shrinkage, negative_BN_log_like
 from .utils import (
     weighting_seeds_manypoint,

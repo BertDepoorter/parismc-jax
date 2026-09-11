@@ -1,11 +1,17 @@
-"""JAX-native PARIS importance sampler (re-architected).
+"""JAX-native PARIS sampler.
 
-This module is a ground-up rewrite of :class:`parismc.sampler.Sampler` that follows
-JAX's  static-shape model instead of the original, which traced samples through a mutated list of ragged arrays.
-The rewrite follows the following three principles that keep the advantages of PARIS while making
-the code JAX-friendly.
+The sampler module is re-implemented as :class:`JaxSampler`, which follows the same overall logic as the original
+but complies with JAX's static shape and functional programming constraints. The API is unchanged, but the 
+internl design is quite different. The original's dynamic list of processes with in-place mutation and 
+variable-dependent lengths is replaced by a fixed-size array of processes with a traced boolean mask. All updates 
+are now purely functional, with the state carried in an immutable :class:`SamplerState` pytree. 
 
+The expensive log-density function is vmapped over all processes inside a jitted step. 
+This replaces the original's multiprocessing pool. The boundary correction optimization 
+is now done with optax instead of scipy, and the merging is done on the host device 
+after computing the distance matrix in JAX.
 
+More details onn design choices:
 1. **A traced boolean ``alive`` mask** of fixed length ``n_proc_max`` replaces the
    shrinking Python list of processes. Merging never changes array shapes; it just flips
    mask bits on the host between jitted blocks. Every per-process kernel is ``vmap``-ed over
@@ -13,8 +19,8 @@ the code JAX-friendly.
    with JAX's static shape requirements for tracing the pyTree during JIT. 
 
 2. **optax optimizer** for the boundary Beta-correction (``find_max_beta``), not the old
-   ``scipy``/``jax.scipy`` ``Powell``/``BFGS`` path. The objective is smoothed (sigmoid
-   relaxation of the boundary indicator) so it is differentiable, then minimized with a
+   ``scipy``/``jax.scipy`` ``Powell``/``BFGS`` path. The objective is smoothed with sigmoid
+   relaxation of the boundary indicator so it is differentiable, then minimized with a
    fixed number of projected Adam steps. This is fully ``jit``/``vmap`` friendly.
 
 3. **No in-place mutation.** All state lives in an immutable :class:`SamplerState`
@@ -22,7 +28,7 @@ the code JAX-friendly.
    driven by ``lax.scan`` over a block of iterations while clustering and I/O happen on host
    between blocks. This balances JIt-advantages with the need for killing redundant processes efficiently.
 
-Design simplifications (documented, not accidental)
+Design simplifications 
 ---------------------------------------------------
 * ``batch_point_num == 1`` (as in the original's actual runtime path). Because every live
   process appends exactly one point per iteration and merging keeps the survivor's fill
@@ -37,9 +43,9 @@ Design simplifications (documented, not accidental)
   :func:`parismc.clustering.pairwise_mahalanobis_matrix` in JAX with the greedy assignment
   on host. The weight-based merge can be layered on top of the same host.
 
-The expensive ``log_density_func`` (e.g. a JAX LISA likelihood) is ``vmap``-ed over all
+The expensive ``log_density_func``, i.e some sort of likelihood, is vmapped over all
 processes inside the jitted step and stays on-device, replacing ``multiprocessing.Pool``. 
-A full JAX rewrite of the clustering/merging is possible but the current hybrid approach retains
+A full JAX rewrite of the clustering/merging is possible but the current hybrid approach keeps
 dynamic control over the number of processes, which is a major part of PARIS's efficiency.
 """
 # handy python stuff
@@ -73,9 +79,8 @@ logger = logging.getLogger(__name__)
 class JaxSamplerConfig:
     """Hyperparameters for :class:`JaxSampler`.
 
-    Shape-determining fields (``n_proc_max``, ``n_max``, ``alpha``, ``trail_size``,
-    ``integral_num``, ``gamma``) are treated as compile-time static; changing them
-    triggers a recompile.
+    Fields (``n_proc_max``, ``n_max``, ``alpha``, ``trail_size``, ``integral_num``, ``gamma``) 
+    determine shapes and should be static at compile time.
     """
     n_proc_max: int                 # static upper bound on number of processes (seeds)
     n_max: int                      # static buffer length per process (max accepted points)
@@ -97,8 +102,8 @@ class JaxSamplerConfig:
 class SamplerState(NamedTuple):
     """Immutable pytree carrying the full sampler state across a scan.
 
-    Leading axis ``P = n_proc_max`` everywhere a per-process quantity appears.
-    ``N = n_max`` is the per-process buffer length, ``H = n_max // gamma + 1`` the
+    Leading axis ``P = n_proc_max`` everywhere there's a per-process quantity appearing.
+    ``N = n_max`` is th buffer length per process, ``H = n_max // gamma + 1`` the
     covariance-history length, ``D`` the dimension.
     """
     points: jnp.ndarray        # (P, N, D)  accepted points (== mixture means)
@@ -124,7 +129,7 @@ class SamplerState(NamedTuple):
 # Sampler
 ##===========================================================================
 class JaxSampler:
-    """Adaptive importance sampler with a jitted inner step and host orchestration.
+    """Adaptive importance sampler with a jitted inner step. Orchestration happens on host.
 
     Parameters
     ----------
@@ -134,7 +139,7 @@ class JaxSampler:
         JAX-traceable (jittable). It is ``vmap``-batched over processes internally.
     config : JaxSamplerConfig
     prior_transform : callable, optional
-        Maps ``[0,1]^d`` to physical space; applied only when returning samples.
+        Maps ``[0,1]^d`` to physical space. This is applied only when returning the samples.
     """
 
     def __init__(self,
@@ -161,7 +166,7 @@ class JaxSampler:
         self._step = self._build_step()
 
     # ------------------------------------------------------------------
-    # Initialization (host side)
+    # Initialization (happens on host)
     # ------------------------------------------------------------------
     def init_state(self,
                    seed_points: np.ndarray,
@@ -188,7 +193,7 @@ class JaxSampler:
         if init_cov.ndim == 2:
             init_cov = np.broadcast_to(init_cov, (n_seed, D, D))
 
-        # Per-process buffers, padded out to P with dead rows.
+        #  buffers per process, padded out to P with dead rows. Value of dead row is np.inf
         points = np.zeros((P, N, D))
         logdens = np.full((P, N), -np.inf)
         wdeno = np.zeros((P, N))
@@ -249,7 +254,7 @@ class JaxSampler:
         return state
 
     # ------------------------------------------------------------------
-    # Per-process numerical primitives (operate on one process; vmapped later)
+    # Per-process numerical primitives. These are batched later
     # ------------------------------------------------------------------
     def _importance_weights(self, logdens_j, wdeno_j, nf, lognorm):
         """Normalized importance weights for one process over filled slots [0, nf)."""
@@ -264,8 +269,14 @@ class JaxSampler:
         uniform = valid / jnp.maximum(jnp.sum(valid), 1)
         return jnp.where(s > 0, w / jnp.where(s > 0, s, 1.0), uniform)
 
-    def _weighting_update_proc(self, points_j, wdeno_j, inv_cov_hist_j, norm_hist_j,
-                               now_inv_j, now_norm_j, nf):
+    def _weighting_update_proc(self, 
+                               points_j, 
+                               wdeno_j, 
+                               inv_cov_hist_j, 
+                               norm_hist_j,
+                               now_inv_j, 
+                               now_norm_j, 
+                               nf):
         """Incremental sliding-window denominator update for one process (3 terms).
 
         Maintains ``wdeno`` over the window ``[ind1, nf)`` of fixed length ``A`` using
@@ -280,6 +291,7 @@ class JaxSampler:
         is_new = abs_idx == (nf - 1)
         is_old = valid & (~is_new)
 
+        # use dynamic slicing to butcher dead or duplicate processes
         pts_win = jax.lax.dynamic_slice(points_j, (ind1, 0), (A, D))      # (A, D)
         wdeno_win = jax.lax.dynamic_slice(wdeno_j, (ind1,), (A,))         # (A,)
         hist_idx = abs_idx // ccount
@@ -293,7 +305,7 @@ class JaxSampler:
         add1 = now_norm_j * jnp.exp(-0.5 * m1) * valid
         wdeno_win = wdeno_win + add1
 
-        # Term 2 (+): the new point picks up all *old* proposals (per-mean cov history).
+        # Term 2 (+): the new point picks up all *old* proposals (cov history per mean).
         d2 = x_new[None, :] - pts_win
         m2 = jnp.einsum('ad,ade,ae->a', d2, inv_win, d2)
         add2 = jnp.sum(norm_win * jnp.exp(-0.5 * m2) * is_old)
@@ -322,6 +334,7 @@ class JaxSampler:
         D = self.D
         cfg = self.cfg
         cov = jax_weighted_cov(points_j, aweights=probs_j)               # (D, D)
+        # TODO: why does covariance not remain symmetric?
         cov = 0.5 * (cov + cov.T)                                        # symmetrize
 
         # Boundary fraction via MC, decides whether the Beta correction is worth applying.
@@ -356,11 +369,11 @@ class JaxSampler:
         return cov_out, inv_out, norm_out
 
     def _generate_proc(self, key, points_j, probs_j, now_cov_j, nf):
-        """Fixed-budget rejection sampling of one new point for one process.
+        """rejection sampling of one new point for one process. There's a limit included
 
         Draws ``trail_size`` mixture-center indices and Gaussian offsets at once, then
-        takes the first in-bounds candidate (falling back to candidate 0). No data-
-        dependent ``while`` loop -> jittable.
+        takes the first in-bounds candidate (falling back to candidate 0). Does not depend on data
+        shapes so can be jitted.
         """
         N, D, T = self.N, self.D, self.cfg.trail_size
         kc, ko = jax.random.split(key)
@@ -400,19 +413,19 @@ class JaxSampler:
             key, k_cov, k_gen = jax.random.split(state.key, 3)
             nf = state.nf
 
-            # 1. Sliding-window denominator update (skip on the very first iteration).
+            # Sliding-window denominator update 
             wdeno = jax.lax.cond(
-                nf > 1,
+                nf > 1,   # In the very first step this is bypassed 
                 lambda: wt_upd(state.points, state.wdeno, state.inv_cov_hist,
                                state.norm_hist, state.now_inv_cov, state.now_norm, nf),
                 lambda: state.wdeno,
             )
 
-            # 2. Importance weights and the per-step weighted mean.
+            # Importance weights and the per-step weighted mean.
             probs = imp_w(state.logdens, wdeno, nf, state.loglike_norm)   # (P, N)
             now_mean = wmean(state.points, probs)                         # (P, D)
 
-            # 3. Covariance update every gamma iterations (history slot nf // gamma).
+            # Covariance update every gamma iterations (history slot nf // gamma).
             do_cov = ((state.it + 1) % gamma) == 0
             proc_keys = jax.random.split(k_cov, self.P)
 
@@ -431,12 +444,12 @@ class JaxSampler:
             now_cov, now_inv, now_norm, inv_hist, norm_hist = jax.lax.cond(
                 do_cov, with_cov, keep_cov)
 
-            # 4. Generate one new point per process (fixed-budget rejection).
+            # Generate one new point per process using rejection smapling with limit
             gen_keys = jax.random.split(k_gen, self.P)
             sel = gen(gen_keys, state.points, probs, now_cov, nf)         # (P, D)
             sel_logdens = log_density_func(sel)                          # (P,)
 
-            # 5. Append the new point at index nf (functional update; no mutation).
+            # Append the new point at index nf (functional update, no in-placemutation).
             points = state.points.at[:, nf, :].set(sel)
             logdens = state.logdens.at[:, nf].set(sel_logdens)
             max_logden = jnp.maximum(state.max_logden, sel_logdens)
@@ -446,13 +459,20 @@ class JaxSampler:
             loglike_norm = jnp.maximum(state.loglike_norm, alive_max)
 
             new_state = state._replace(
-                points=points, logdens=logdens, wdeno=wdeno,
-                inv_cov_hist=inv_hist, norm_hist=norm_hist,
-                now_cov=now_cov, now_inv_cov=now_inv, now_norm=now_norm,
+                points=points, 
+                logdens=logdens, 
+                wdeno=wdeno,
+                inv_cov_hist=inv_hist, 
+                norm_hist=norm_hist,
+                now_cov=now_cov, 
+                now_inv_cov=now_inv, 
+                now_norm=now_norm,
                 now_mean=now_mean,
                 max_logden=max_logden,
-                nf=nf + 1, it=state.it + 1,
-                loglike_norm=loglike_norm, key=key,
+                nf=nf + 1, 
+                it=state.it + 1,
+                loglike_norm=loglike_norm, 
+                key=key,
             )
             return new_state, None
 
@@ -460,14 +480,15 @@ class JaxSampler:
                        static_argnums=(1,))
 
     # ------------------------------------------------------------------
-    # Host-side merging (the only inherently-sequential piece)
+    # Merging of processes happens on the host side
     # ------------------------------------------------------------------
     def _merge_host(self, state: SamplerState) -> SamplerState:
         """Distance-based merge: deactivate redundant processes via the ``alive`` mask.
 
-        The quadratic Mahalanobis matrix is computed in JAX; the greedy assignment runs on
-        host. Survivors keep their data in place (no reindexing); merged processes are
-        simply marked dead.
+        The quadratic Mahalanobis matrix is computed in JAX. The greedy assignment runs on
+        host. Survivors keep their data in place, so indexing remains unaffected. 
+        Merged processes are simply marked as dead. maybe not the cleanest option but otherwise 
+        we lose advantage of compiled code.
         """
         means = np.asarray(state.now_mean)
         inv_covs = np.asarray(state.now_inv_cov)
@@ -552,7 +573,7 @@ class JaxSampler:
         return np.concatenate(all_pts), np.concatenate(all_w)
 
     # ------------------------------------------------------------------
-    # Driver: jitted blocks + host merging in between
+    # Driver function: jitted blocks + host merging in between
     # ------------------------------------------------------------------
     def run(self,
             num_iterations: int,
@@ -561,8 +582,8 @@ class JaxSampler:
         """Run the sampler.
 
         The iteration budget is split into blocks of ``merge_every`` steps. Each block runs
-        as a single jitted ``lax.scan`` (the hot path, GPU-resident); between blocks we do
-        host-side clustering/merging and optional logging. ``merge_every`` defaults to
+        as a single jitted ``lax.scan`` on the GPU.  Between blocks we do
+        clustering/merging on the host and optional logging. ``merge_every`` defaults to
         ``gamma`` so merging is aligned with covariance updates.
         """
         if self.state is None:
