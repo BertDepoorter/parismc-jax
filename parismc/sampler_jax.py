@@ -193,7 +193,8 @@ class JaxSampler:
         if init_cov.ndim == 2:
             init_cov = np.broadcast_to(init_cov, (n_seed, D, D))
 
-        #  buffers per process, padded out to P with dead rows. Value of dead row is np.inf
+        # Buffers per process, padded out to P with dead rows. Dead rows hold zeros for
+        # points/wdeno and -inf for logdens; they are excluded via the `alive` mask.
         points = np.zeros((P, N, D))
         logdens = np.full((P, N), -np.inf)
         wdeno = np.zeros((P, N))
@@ -291,7 +292,8 @@ class JaxSampler:
         is_new = abs_idx == (nf - 1)
         is_old = valid & (~is_new)
 
-        # use dynamic slicing to butcher dead or duplicate processes
+        # Extract the sliding denominator window [ind1, ind1 + A) with a static-shape
+        # dynamic_slice (the offset is traced, the length is not).
         pts_win = jax.lax.dynamic_slice(points_j, (ind1, 0), (A, D))      # (A, D)
         wdeno_win = jax.lax.dynamic_slice(wdeno_j, (ind1,), (A,))         # (A,)
         hist_idx = abs_idx // ccount

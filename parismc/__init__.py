@@ -29,6 +29,8 @@ __email__ = "miaoxin.liu@u.nus.edu"
 __all__ = [
     'Sampler',
     'SamplerConfig',
+    'JaxSampler',
+    'JaxSamplerConfig',
     'find_max_beta',
     'oracle_approximating_shrinkage',
     'weighting_seeds_manypoint',
